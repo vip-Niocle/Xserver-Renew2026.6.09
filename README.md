@@ -1,10 +1,16 @@
-# XServer 游戏服务器自动续签（自适应版）
+# XServer 游戏服务器自动续签
 
-自动延长 XServer Game 实例期限，支持多账号、代理和 Telegram 通知。采用**自适应智能调度**，自动感知剩余时间并决策最优签到时机。
+自动延长 XServer Game VPS 实例期限，支持多账号、代理和 Telegram 通知。
+
+**核心特性：**
+- 🧠 **自适应续期阈值** — 自动读取续期页面，无需配置套餐类型
+- 🔄 **状态持久化** — 预约日期精确写入 `status.json`，非预约日秒退
+- ⏱ **可配置延迟** — 通过 `T` 变量自定义定时/随机延迟
+- 📸 **失败截图** — 每次运行自动截图保存，便于排查
 
 ---
 
-## 前期准备：关闭邮件验证功能
+## 📋 前期准备：关闭邮件验证
 
 > ⚠️ **重要**：请严格按照以下步骤操作，否则脚本可能因邮件验证而失败。
 
@@ -18,11 +24,11 @@
 
 ### 3. 修改「可疑登录期间的身份验证」为「无效的」
 
-<img width="1389" height="346" alt="image" src="https://github.com/user-attachments/assets/467d2e1e-7a3b-4acb-aa7c-92cc76af6126" />
+<img width="1694" height="367" alt="image" src="https://github.com/user-attachments/assets/f331a64b-e94f-4663-8530-67e438264302" />
 
 ---
 
-## 使用方法
+## 🚀 使用方法
 
 ### 第一步：Fork 本仓库
 
@@ -34,14 +40,27 @@
 
 点击 **New repository secret**，添加以下配置：
 
-| Secret 名称 | 必填 | 说明 |
+| Secret | 必填 | 说明 |
 |:---|:---:|:---|
-| `EML_1` | ✅ | 第1个账号的登录邮箱或ID |
-| `PWD_1` | ✅ | 第1个账号的密码 |
-| `EML_2` / `PWD_2` | ❌ | 第2个账号（以此类推） |
+| `EML_1` | ✅ | 第 1 个账号的登录邮箱或 ID |
+| `PWD_1` | ✅ | 第 1 个账号的密码 |
+| `EML_2` / `PWD_2` | ❌ | 第 2 个账号（以此类推，不限数量） |
+| `T` | ❌ | 延迟控制（见下方说明） |
 | `TG_TOKEN` | ❌ | Telegram Bot Token（从 @BotFather 获取） |
 | `TG_ID` | ❌ | 接收通知的用户/群组 ID |
-| `PROXY_URL` | ❌ | 代理链接（支持 socks5/http/vless/vmess/tuic/hy2） |
+| `PROXY_URL` | ❌ | 代理链接 |
+
+#### T 延迟控制
+
+进入可续期窗口后，在签到的**前一刻**插入延迟。
+
+| 值 | 行为 | 示例 |
+|:---|:---|:---|
+| **不设置** | 无延迟，立即签到 | — |
+| **单个数字** | 固定延迟 N 分钟 | `T=15` → 固定等 15 分钟 |
+| **A-B 范围** | 随机延迟 A~B 分钟 | `T=10-60` → 随机等 10~60 分钟 |
+
+> **手动触发**（`Run workflow`）时 T 延迟自动跳过，即点即签。
 
 #### 多账号配置示例
 
@@ -50,8 +69,6 @@ EML_1 = account1@example.com
 PWD_1 = password1
 EML_2 = account2@example.com
 PWD_2 = password2
-EML_3 = account3@example.com
-PWD_3 = password3
 ```
 
 #### 代理格式示例
@@ -59,18 +76,19 @@ PWD_3 = password3
 支持 Base64 编码和明文两种格式：
 
 ```
-tuic://uuid:password@server:port?sni=domain.com
+socks5://user:pass@server:port
+http://user:pass@server:port
 vless://uuid@server:port?security=tls&sni=domain.com
 vmess://eyJhZGQiOiIxMjcuMC4wLjEiLCJpZCI6InV1aWQifQ==
+tuic://uuid:password@server:port?sni=domain.com
 hy2://password@server:port?sni=domain.com
-socks5://user:pass@server:port
 ```
 
 ### 第三步：运行
 
 #### 自动运行
 
-脚本每天北京时间 **06:00** 开始自动感知剩余时间并决策最优签到时机。
+脚本每天北京时间 **06:00** 自动执行。可通过修改 `.github/workflows/renew.yml` 中的 `cron` 调整时间或增加执行次数。
 
 #### 手动运行
 
@@ -79,21 +97,72 @@ socks5://user:pass@server:port
 3. 点击 **Run workflow**
 
 ---
-## Telegram 通知说明
+
+## 🧠 自适应调度逻辑
+
+脚本不再依赖硬编码的套餐类型，而是直接从**续期页面**获取规则。
+
+### 流程
+
+```
+登录 → 游戏管理 → 进入续期页面
+                    │
+        ┌───────────┴───────────┐
+        │                       │
+   受限（页面有提示）        可续期
+        │                       │
+  ┌─────┴──────┐          应用 T 延迟
+  │             │          tryRenew()
+有精确日期    只有阈值      ├─ 续签成功
+(2026-06-10)  剩余>阈值    └─ 按钮未出现
+  │             │
+写 exact date  算天数推后
+exit(0)        exit(0)
+```
+
+### 核心能力
+
+- **自动读取阈值** — 页面显示「残り契約時間が 16 時間を切るまで…」，脚本自动解析阈值，无需配置套餐
+- **精确日期优先** — 页面给出「2026-06-10 20:40 以降にお試しください」时，直接预约到该天
+- **续期后动态计算** — 根据续期后的新剩余时间与阈值之差，动态算出下次检查日，替代写死天数
+
+---
+
+## 💾 状态持久化
+
+脚本通过 `status.json` 记住每个账号的预约日期：
+
+```json
+{
+  "account@example.com": {
+    "nextCheckDate": "2026-06-10",
+    "lastSuccess": 1742380800000
+  }
+}
+```
+
+- **非预约日期** — GitHub Actions 触发时直接秒退，不启动浏览器
+- **预约日期到达** — 启动浏览器，登录后进入续期页面
+- **续签成功** — 自动根据新剩余时间计算下次预约日，并 git push 更新状态
+
+---
+
+## 🤖 Telegram 通知
 
 | 图标 | 状态 | 说明 |
 |:---:|:---|:---|
 | ✅ | 续签成功 | 实例已延期，显示续签前后剩余时间对比 |
+| 🧊 | 冷却等待 | 页面受限，有精确的可续期时间 |
 | 🔭 | 探测跳过 | 剩余时间充足，预约 N 天后检查 |
-| 🎯 | 伏击模式 | 正在随机延迟中，即将执行续签 |
-| 🚨 | 紧急模式 | 剩余时间不足，立即执行续签 |
+| 🎲 | 随机延迟 | 设置了 T 范围延迟 |
+| ⏳ | 固定延迟 | 设置了 T 固定延迟 |
 | 🕐 | 等待中 | 首次运行，延期按钮未出现 |
 | ⚠️ | 跳过 | 未到续签时间 |
 | ❌ | 失败 | 出现错误 |
 
 ---
 
-## 常见问题
+## ❓ 常见问题
 
 ### 签到失败怎么办？
 
@@ -108,19 +177,26 @@ socks5://user:pass@server:port
 
 ### 支持多少个账号？
 
-无限制。按顺序添加 `EML_1`/`PWD_1`、`EML_2`/`PWD_2` ... 即可。每个账号独立计算剩余时间和预约日期。
+无限制。按顺序添加 `EML_1`/`PWD_1`、`EML_2`/`PWD_2` … 即可。每个账号独立计算剩余时间和预约日期。
 
 ### 为什么有时候脚本秒退？
 
-这正是自适应调度的核心优势。如果今天不是某个账号的预约日期（`nextCheckDate`），脚本会直接退出，不启动浏览器，不消耗 GitHub Actions额度。
+如果今天不是某个账号的预约日期（`nextCheckDate`），脚本会直接退出，不启动浏览器，不消耗 GitHub Actions 额度。
+
+### 需要设置套餐类型吗？
+
+不需要。脚本自动从续期页面读取阈值（如 16h），适配任意套餐。
 
 ---
 
-## 注意事项
+## ⚠️ 注意事项
 
-- 签到按钮在实例开通/续签后 **48小时** 才会出现
+- 签到按钮在实例开通/续签后 **48 小时** 才会出现
 - 首次使用建议手动触发一次，确认配置正确
-- GitHub Actions 目前暂不支持 **IPv6** 节点
-## 🌟 特别鸣谢
+- GitHub Actions 不支持 IPv6，如需访问 IPv6 节点请使用代理
 
-在此感谢 [XCQ0607/Xserver_script](https://github.com/XCQ0607/Xserver_script) 项目提供的 nodejs 签到思路。
+---
+
+## 🌟 鸣谢
+
+感谢 [XCQ0607/Xserver_script](https://github.com/XCQ0607/Xserver_script) 项目提供的 Node.js 签到思路。

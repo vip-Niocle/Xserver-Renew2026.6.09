@@ -9,8 +9,32 @@ const TG_TOKEN = process.env.TG_TOKEN;
 const TG_ID = process.env.TG_ID;
 const PROXY_URL = process.env.PROXY_URL;
 
+// T 延迟控制（单位：分钟）
+//   不设置       → 无延迟，进窗口立刻执行
+//   单个数字     → 固定延迟 N 分钟
+//   A-B         → 随机延迟 A~B 分钟
+//   手动触发时永不延迟
+const T = process.env.T;
+const IS_MANUAL = process.env.GITHUB_EVENT_NAME === 'workflow_dispatch' || !process.env.GITHUB_ACTIONS;
+let DELAY_MS = 0;
+if (T && !IS_MANUAL) {
+  const range = T.match(/^(\d+)\s*-\s*(\d+)$/);
+  const fixed = T.match(/^(\d+)$/);
+  if (range) {
+    const lo = parseInt(range[1]), hi = parseInt(range[2]);
+    DELAY_MS = (Math.floor(Math.random() * (hi - lo + 1)) + lo) * 60000;
+    console.log('🎲 随机延迟 ' + (DELAY_MS / 60000) + ' 分钟（范围 ' + lo + '-' + hi + '）');
+  } else if (fixed) {
+    DELAY_MS = parseInt(fixed[1]) * 60000;
+    console.log('⏳ 固定延迟 ' + (DELAY_MS / 60000) + ' 分钟');
+  }
+}
+if (IS_MANUAL) console.log('🖱️ 手动触发模式，跳过延迟');
+
 const LOGIN_URL = 'https://secure.xserver.ne.jp/xapanel/login/xmgame';
 const STATUS_FILE = 'status.json';
+
+// ── 状态持久化 ──
 
 function loadStatus() {
   try {
@@ -30,16 +54,19 @@ function getAccountStatus() {
 function gitCommitPush(commitMsg) {
   try {
     execSync('git config --global user.email "bot@xserver.renew" && git config --global user.name "XServer Bot"', { stdio: 'pipe' });
+    execSync('git pull --rebase origin main', { stdio: 'pipe' });
     execSync('git add status.json', { stdio: 'pipe' });
     execSync('git commit -m "' + commitMsg + '"', { stdio: 'pipe' });
     execSync('git push', { stdio: 'pipe' });
     console.log('📤 status.json 已推送');
     return true;
   } catch (e) {
-    console.log('⚠️ Git 推送失败（非 Git 环境或无远程）');
+    console.log('⚠️ status.json 推送失败（将被 workflow 兜底）');
     return false;
   }
 }
+
+// ── 日期工具 ──
 
 function getTodayStr() {
   return new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
@@ -51,9 +78,11 @@ function addDaysStr(dateStr, days) {
   return d.toISOString().slice(0, 10);
 }
 
-function formatSeconds(sec) {
-  return Math.floor(sec / 3600) + '小时' + Math.floor((sec % 3600) / 60) + '分钟';
+function formatMinutes(min) {
+  return Math.floor(min / 60) + '小时' + (min % 60) + '分钟';
 }
+
+// ── Telegram 通知 ──
 
 async function sendTG(statusIcon, statusText, extra, imagePath) {
   if (!TG_TOKEN || !TG_ID) return;
@@ -83,11 +112,13 @@ async function sendTG(statusIcon, statusText, extra, imagePath) {
   } catch (e) { console.log('⚠️ TG 发送失败:', e.message); }
 }
 
+// ── 调度 ──
+
 function checkScheduling() {
   const today = getTodayStr();
   const s = getAccountStatus();
   if (!s.nextCheckDate) { console.log('🆕 首次运行'); return; }
-  if (process.env.GITHUB_EVENT_NAME !== 'schedule') { console.log('💻 本地模式'); return; }
+  if (process.env.GITHUB_EVENT_NAME !== 'schedule') { console.log('💻 手动触发'); return; }
   if (today < s.nextCheckDate) {
     var days = Math.ceil((new Date(s.nextCheckDate) - new Date(today)) / 86400000);
     console.log('⏳ 预约 ' + s.nextCheckDate + '，还剩 ' + days + ' 天，秒退');
@@ -95,6 +126,27 @@ function checkScheduling() {
   }
   console.log('📅 到达预约日期 ' + today);
 }
+
+function updateNextCheckDate(daysLater, reason) {
+  var next = addDaysStr(getTodayStr(), daysLater);
+  var status = loadStatus();
+  if (!status[ACC]) status[ACC] = {};
+  status[ACC].nextCheckDate = next;
+  saveStatus(status);
+  console.log('📅 下次预约: ' + next + '（' + reason + '）');
+  gitCommitPush('[Bot] ' + ACC + ' 下次检查 ' + next);
+}
+
+function updateNextCheckDateByDate(dateStr, reason) {
+  var status = loadStatus();
+  if (!status[ACC]) status[ACC] = {};
+  status[ACC].nextCheckDate = dateStr;
+  saveStatus(status);
+  console.log('📅 下次预约: ' + dateStr + '（' + reason + '）');
+  gitCommitPush('[Bot] ' + ACC + ' 下次检查 ' + dateStr);
+}
+
+// ── 页面解析 ──
 
 async function parseRemainingMinutes(page) {
   try {
@@ -116,43 +168,85 @@ async function parseRemainingMinutes(page) {
   } catch (e) { console.log('⚠️ 解析失败:', e.message); return null; }
 }
 
-function updateNextCheckDate(daysLater, reason) {
-  var next = addDaysStr(getTodayStr(), daysLater);
-  var status = loadStatus();
-  if (!status[ACC]) status[ACC] = {};
-  status[ACC].nextCheckDate = next;
-  saveStatus(status);
-  console.log('📅 下次预约: ' + next + '（' + reason + '）');
-  gitCommitPush('[Bot] ' + ACC + ' 下次检查 ' + next);
+/**
+ * 读取续期页面，检测是否有限制提示
+ *
+ * 受限时页面包含如：
+ *   残り契約時間が16時間を切るまで、期限の延長は行えません。
+ *   更新をご希望の場合は、2026-06-10 20:40以降にお試しください。
+ *
+ * @returns {{ restricted: boolean|null, thresholdHours: number|null, nextDate: string|null, nextTime: string|null }}
+ */
+async function parseExtendPage(page) {
+  try {
+    await page.waitForTimeout(2000);
+    var text = await page.textContent('body');
+  } catch (e) {
+    console.log('⚠️ 未能读取续期页面');
+    return { restricted: null, thresholdHours: null, nextDate: null, nextTime: null };
+  }
+
+  var thresholdMatch = text.match(/残り契約時間が(\d+)時間を切るまで/);
+  var nextMatch = text.match(/(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})以降/);
+
+  if (thresholdMatch) {
+    var thresholdHours = parseInt(thresholdMatch[1]);
+    var nextDate = nextMatch ? nextMatch[1] : null;
+    var nextTime = nextMatch ? nextMatch[1] + ' ' + nextMatch[2] : null;
+    console.log('🧊 受限: 阈值=' + thresholdHours + 'h, 可续期=' + (nextTime || '未知'));
+    return { restricted: true, thresholdHours: thresholdHours, nextDate: nextDate, nextTime: nextTime };
+  }
+
+  console.log('✅ 可执行续期');
+  return { restricted: false, thresholdHours: null, nextDate: null, nextTime: null };
 }
 
-async function tryRenew(page, beforeMins) {
+// ── 续期操作 ──
+
+async function tryRenew(page, beforeMins, thresholdHours) {
   try {
-    console.log('🔄 滚动到页面底部...'); await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)); await page.waitForTimeout(2000);
+    console.log('🔄 滚动到页面底部...');
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(2000);
+
     await page.getByRole('link', { name: '期限を延長する' }).waitFor({ state: 'visible', timeout: 5000 });
     await page.getByRole('link', { name: '期限を延長する' }).click();
     await page.waitForLoadState('load');
+
     await page.getByRole('button', { name: '確認画面に進む' }).click();
     await page.waitForLoadState('load');
+
     console.log('🖱️ 执行延期...');
     await page.getByRole('button', { name: '期限を延長する' }).click();
     await page.waitForLoadState('load');
     await page.screenshot({ path: '5_before_back.png' });
-    console.log('✅ 延期成功，正在获取新的剩余时间...');
+
+    console.log('✅ 延期成功，获取新剩余时间...');
     await page.getByRole('link', { name: '戻る' }).click();
     await page.waitForLoadState('load');
     await page.screenshot({ path: 'success.png' });
+
     var afterMins = await parseRemainingMinutes(page);
     var beforeH = beforeMins ? (beforeMins / 60).toFixed(1) : '?';
     var afterH = afterMins ? (afterMins / 60).toFixed(1) : '?';
     var timeInfo = '续签前 ' + beforeH + 'h → 续签后 ' + afterH + 'h';
     console.log('⏱️ ' + timeInfo);
+
+    // 动态计算下次检查：用续期后剩余时间 - 阈值，算出几天后再查
+    var nextDays = 3;
+    if (afterMins !== null && thresholdHours !== null) {
+      var newH = afterMins / 60;
+      var calcDays = Math.ceil((newH - thresholdHours) / 24);
+      nextDays = Math.max(1, calcDays);
+      console.log('📐 续期后剩余 ' + newH.toFixed(1) + 'h，阈值 ' + thresholdHours + 'h，约 ' + nextDays + ' 天后复查');
+    }
+
     var status = loadStatus();
     if (!status[ACC]) status[ACC] = {};
     status[ACC].lastSuccess = Date.now();
     saveStatus(status);
-    updateNextCheckDate(3, '续签成功');
-    await sendTG('✅', '续签成功', timeInfo + '\n下次检查3天后', 'success.png');
+    updateNextCheckDate(nextDays, '续签成功');
+    await sendTG('✅', '续签成功', timeInfo + '\n下次检查' + nextDays + '天后', 'success.png');
   } catch (e) {
     console.log('⚠️ 未找到延期按钮');
     await page.screenshot({ path: 'skip.png' });
@@ -162,17 +256,24 @@ async function tryRenew(page, beforeMins) {
   }
 }
 
+// ── 主流程 ──
+
 (async function main() {
   console.log('==================================================');
   console.log('XServer 自动延期 (自适应版)');
   console.log('==================================================');
+
   if (!ACC || !ACC_PWD) { console.log('❌ 未找到账号或密码'); process.exit(1); }
   checkScheduling();
+
   var launchOpts = { headless: true, channel: 'chrome' };
   if (PROXY_URL) launchOpts.proxy = { server: 'http://127.0.0.1:8080' };
   var browser = await chromium.launch(launchOpts);
   var context = await browser.newContext({ viewport: { width: 1920, height: 1080 } });
   var page = await context.newPage();
+
+  var thresholdHours = null;  // 从续期页面捕获，传给 tryRenew
+
   try {
     if (PROXY_URL) {
       console.log('🌐 检查代理 IP...');
@@ -181,48 +282,76 @@ async function tryRenew(page, beforeMins) {
         console.log('✅ IP: ' + JSON.parse(await page.textContent('body')).ip);
       } catch (e) { console.log('⚠️ IP 检查失败'); }
     }
+
     console.log('🌐 打开登录页面');
     await page.goto(LOGIN_URL, { waitUntil: 'load', timeout: 30000 });
     await page.screenshot({ path: '1_navigation.png' });
+
     console.log('📧 填写账号密码');
     await page.locator('#memberid').fill(ACC);
     await page.locator('#user_password').fill(ACC_PWD);
     await page.screenshot({ path: '1.5_filled.png' });
+
     console.log('🖱️ 提交登录');
     await Promise.all([
       page.waitForNavigation({ waitUntil: 'load', timeout: 30000 }),
       page.locator('input[name="action_user_login"]').click()
     ]);
     await page.screenshot({ path: '2_after_login.png' });
+
     console.log('🚀 点击游戏管理');
     await page.getByRole('link', { name: 'ゲーム管理' }).click();
     await page.waitForLoadState('load');
     await page.screenshot({ path: '3_game_manage.png' });
+
+    // 从游戏管理页面获取剩余时间
     var totalMins = await parseRemainingMinutes(page);
-    console.log('🚀 点击延期');
+
+    console.log('🚀 进入续期页面');
     await page.getByRole('link', { name: 'アップグレード・期限延長' }).click();
     await page.screenshot({ path: '4_renew_page.png' });
-    if (totalMins === null) {
-      console.log('⚠️ 无法解析剩余时间，尝试直接续签');
-      await tryRenew(page, null);
-    } else {
-      var h = totalMins / 60;
-      if (h > 24) {
-        var skip = Math.max(1, Math.floor((h - 24) / 24));
-        console.log('🔭 探测模式: ' + h.toFixed(1) + '小时 → 预约' + skip + '天后');
-        await sendTG('🔭', '探测跳过', '剩余' + h.toFixed(1) + 'h，' + skip + '天后检查', '3_game_manage.png');
-        updateNextCheckDate(skip, '探测模式跳过' + skip + '天');
-      } else if (h > 6) {
-        var delay = Math.floor(Math.random() * 6 * 3600);
-        console.log('🎯 伏击模式: 随机延迟' + formatSeconds(delay));
-        await sendTG('🎯', '伏击模式', formatSeconds(delay) + '后执行');
-        await new Promise(function(r) { setTimeout(r, delay * 1000); });
-        await tryRenew(page, totalMins);
+
+    // 读取续期页面：受限时包含阈值和可续期时间
+    var extendInfo = await parseExtendPage(page);
+
+    if (extendInfo.restricted) {
+      thresholdHours = extendInfo.thresholdHours;
+
+      if (extendInfo.nextDate && extendInfo.nextDate > getTodayStr()) {
+        // 有精确的后续可续期日期
+        console.log('📅 预约 ' + extendInfo.nextDate + ' 再检查');
+        await sendTG('🧊', '冷却等待', '可续期: ' + extendInfo.nextTime);
+        updateNextCheckDateByDate(extendInfo.nextDate, '冷却中');
+        process.exit(0);
+      }
+
+      // 无精确日期，或日期就是今天（时间未到），用剩余时间估算
+      if (totalMins !== null && thresholdHours !== null) {
+        var h = totalMins / 60;
+        if (h > thresholdHours) {
+          var hoursToGo = h - thresholdHours;
+          var days = Math.max(1, Math.ceil(hoursToGo / 24));
+          console.log('🔭 剩余 ' + h.toFixed(1) + 'h > 阈值 ' + thresholdHours + 'h，预约 ' + days + ' 天后');
+          await sendTG('🔭', '探测跳过', '剩余 ' + h.toFixed(1) + 'h，预约 ' + days + ' 天后');
+          updateNextCheckDate(days, '等待进入可续期窗口');
+          process.exit(0);
+        }
+        // 剩余 ≤ 阈值但页面仍受限 → 可能按钮尚未出现，尝试执行
+        console.log('⚠️ 剩余时间已达标但页面受限，尝试续期');
       } else {
-        console.log('🚨 紧急模式: ' + h.toFixed(1) + '小时，立即执行');
-        await tryRenew(page, totalMins);
+        console.log('⚠️ 无法分析，尝试直接续期');
       }
     }
+
+    // ── 可续期窗口 ──
+    if (DELAY_MS > 0) {
+      console.log('⏳ T 延迟 ' + (DELAY_MS / 60000).toFixed(1) + ' 分钟...');
+      await new Promise(function(r) { setTimeout(r, DELAY_MS); });
+    }
+
+    console.log('🚀 执行续期');
+    await tryRenew(page, totalMins, thresholdHours);
+
   } catch (error) {
     console.log('❌ 流程失败: ' + error.message);
     await page.screenshot({ path: 'failure.png' });

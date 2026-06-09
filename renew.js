@@ -34,6 +34,9 @@ if (IS_MANUAL) console.log('🖱️ 手动触发模式，跳过延迟');
 const LOGIN_URL = 'https://secure.xserver.ne.jp/xapanel/login/xmgame';
 const STATUS_FILE = 'status.json';
 
+// 时区：续期页面时间为日本时间 (JST, UTC+9)
+const TZ_OFFSET = 9;
+
 // ── 状态持久化 ──
 
 function loadStatus() {
@@ -68,8 +71,18 @@ function gitCommitPush(commitMsg) {
 
 // ── 日期工具 ──
 
+function getNowJST() {
+  return new Date(Date.now() + TZ_OFFSET * 3600000);
+}
+
 function getTodayStr() {
-  return new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
+  return getNowJST().toISOString().slice(0, 10);
+}
+
+// 当前 JST 分钟数（从 00:00 起），用于比较页面给的具体时间
+function getNowJSTMinutes() {
+  var d = getNowJST();
+  return d.getUTCHours() * 60 + d.getUTCMinutes();
 }
 
 function addDaysStr(dateStr, days) {
@@ -78,18 +91,54 @@ function addDaysStr(dateStr, days) {
   return d.toISOString().slice(0, 10);
 }
 
-function formatMinutes(min) {
-  return Math.floor(min / 60) + '小时' + (min % 60) + '分钟';
+// ── Telegram 通知（带每日去重）──
+
+async function sendTGOnce(statusIcon, statusText, extra, imagePath) {
+  if (!TG_TOKEN || !TG_ID) return;
+  var today = getTodayStr();
+  var s = getAccountStatus();
+  if (s.notifiedDate === today) {
+    console.log('🔇 今日已通知过，跳过');
+    return;
+  }
+  extra = extra || '';
+  imagePath = imagePath || null;
+  try {
+    var time = getNowJST().toISOString().replace('T', ' ').slice(0, 19);
+    var text = 'XServer 延期提醒\n' + statusIcon + ' ' + statusText + '\n' + extra + '\n账号: ' + ACC + '\n时间: ' + time;
+    if (imagePath && fs.existsSync(imagePath)) {
+      var fileData = fs.readFileSync(imagePath);
+      var fd = new FormData();
+      fd.append('chat_id', TG_ID);
+      fd.append('caption', text);
+      fd.append('photo', new Blob([fileData], { type: 'image/png' }), path.basename(imagePath));
+      var res = await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/sendPhoto', { method: 'POST', body: fd });
+      if (res.ok) console.log('✅ TG 通知已发送');
+      else console.log('⚠️ TG 发送失败:', res.status, await res.text());
+    } else {
+      var res2 = await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/sendMessage', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: TG_ID, text: text })
+      });
+      if (res2.ok) console.log('✅ TG 通知已发送');
+      else console.log('⚠️ TG 发送失败:', res2.status, await res2.text());
+    }
+    // 标记今日已通知
+    var status = loadStatus();
+    if (!status[ACC]) status[ACC] = {};
+    status[ACC].notifiedDate = today;
+    saveStatus(status);
+  } catch (e) { console.log('⚠️ TG 发送失败:', e.message); }
 }
 
-// ── Telegram 通知 ──
-
 async function sendTG(statusIcon, statusText, extra, imagePath) {
+  // 续签成功通知不受去重限制
   if (!TG_TOKEN || !TG_ID) return;
   extra = extra || '';
   imagePath = imagePath || null;
   try {
-    var time = new Date(Date.now() + 8 * 3600000).toISOString().replace('T', ' ').slice(0, 19);
+    var time = getNowJST().toISOString().replace('T', ' ').slice(0, 19);
     var text = 'XServer 延期提醒\n' + statusIcon + ' ' + statusText + '\n' + extra + '\n账号: ' + ACC + '\n时间: ' + time;
     if (imagePath && fs.existsSync(imagePath)) {
       var fileData = fs.readFileSync(imagePath);
@@ -132,6 +181,7 @@ function updateNextCheckDate(daysLater, reason) {
   var status = loadStatus();
   if (!status[ACC]) status[ACC] = {};
   status[ACC].nextCheckDate = next;
+  delete status[ACC].notifiedDate;  // 日期变了，清空通知标记
   saveStatus(status);
   console.log('📅 下次预约: ' + next + '（' + reason + '）');
   gitCommitPush('[Bot] ' + ACC + ' 下次检查 ' + next);
@@ -144,6 +194,19 @@ function updateNextCheckDateByDate(dateStr, reason) {
   saveStatus(status);
   console.log('📅 下次预约: ' + dateStr + '（' + reason + '）');
   gitCommitPush('[Bot] ' + ACC + ' 下次检查 ' + dateStr);
+}
+
+async function setTodayAndExit(msg) {
+  console.log('🔄 ' + msg + '，设今天为预约日继续轮询');
+  var status = loadStatus();
+  if (!status[ACC]) status[ACC] = {};
+  status[ACC].nextCheckDate = getTodayStr();
+  saveStatus(status);
+  // 当天第一次跑才发 TG（内部写 notifiedDate 到 status.json）
+  await sendTGOnce('🧊', '等待可续期', msg);
+  // 推送 status.json（含 nextCheckDate + notifiedDate）回仓库
+  gitCommitPush('[Bot] ' + ACC + ' 轮询日 ' + getTodayStr());
+  process.exit(0);
 }
 
 // ── 页面解析 ──
@@ -175,7 +238,7 @@ async function parseRemainingMinutes(page) {
  *   残り契約時間が16時間を切るまで、期限の延長は行えません。
  *   更新をご希望の場合は、2026-06-10 20:40以降にお試しください。
  *
- * @returns {{ restricted: boolean|null, thresholdHours: number|null, nextDate: string|null, nextTime: string|null }}
+ * @returns {{ restricted: boolean|null, thresholdHours: number|null, nextDate: string|null, nextTime: string|null, nextMinutes: number|null }}
  */
 async function parseExtendPage(page) {
   try {
@@ -183,7 +246,7 @@ async function parseExtendPage(page) {
     var text = await page.textContent('body');
   } catch (e) {
     console.log('⚠️ 未能读取续期页面');
-    return { restricted: null, thresholdHours: null, nextDate: null, nextTime: null };
+    return { restricted: null, thresholdHours: null, nextDate: null, nextTime: null, nextMinutes: null };
   }
 
   var thresholdMatch = text.match(/残り契約時間が(\d+)時間を切るまで/);
@@ -192,13 +255,14 @@ async function parseExtendPage(page) {
   if (thresholdMatch) {
     var thresholdHours = parseInt(thresholdMatch[1]);
     var nextDate = nextMatch ? nextMatch[1] : null;
-    var nextTime = nextMatch ? nextMatch[1] + ' ' + nextMatch[2] : null;
-    console.log('🧊 受限: 阈值=' + thresholdHours + 'h, 可续期=' + (nextTime || '未知'));
-    return { restricted: true, thresholdHours: thresholdHours, nextDate: nextDate, nextTime: nextTime };
+    var nextTime = nextMatch ? nextMatch[2] : null;
+    var nextMinutes = nextMatch ? parseInt(nextMatch[2].split(':')[0]) * 60 + parseInt(nextMatch[2].split(':')[1]) : null;
+    console.log('🧊 受限: 阈值=' + thresholdHours + 'h, 可续期=' + (nextTime ? nextDate + ' ' + nextTime : '未知'));
+    return { restricted: true, thresholdHours: thresholdHours, nextDate: nextDate, nextTime: nextTime, nextMinutes: nextMinutes };
   }
 
   console.log('✅ 可执行续期');
-  return { restricted: false, thresholdHours: null, nextDate: null, nextTime: null };
+  return { restricted: false, thresholdHours: null, nextDate: null, nextTime: null, nextMinutes: null };
 }
 
 // ── 续期操作 ──
@@ -317,22 +381,31 @@ async function tryRenew(page, beforeMins, thresholdHours) {
     if (extendInfo.restricted) {
       thresholdHours = extendInfo.thresholdHours;
 
+      // 1. 有精确的未来日期 → 预约到那天，退出
       if (extendInfo.nextDate && extendInfo.nextDate > getTodayStr()) {
-        // 有精确的后续可续期日期
         console.log('📅 预约 ' + extendInfo.nextDate + ' 再检查');
-        await sendTG('🧊', '冷却等待', '可续期: ' + extendInfo.nextTime);
+        await sendTGOnce('🧊', '冷却等待', '可续期: ' + extendInfo.nextDate + ' ' + (extendInfo.nextTime || ''));
         updateNextCheckDateByDate(extendInfo.nextDate, '冷却中');
         process.exit(0);
       }
 
-      // 无精确日期，或日期就是今天（时间未到），用剩余时间估算
+      // 2. 日期=今天但时间未到 → 设今天为预约日，靠 cron 轮询
+      if (extendInfo.nextDate === getTodayStr() && extendInfo.nextMinutes !== null) {
+        var nowMin = getNowJSTMinutes();
+        var waitMin = extendInfo.nextMinutes - nowMin;
+        if (waitMin > 0) {
+          await setTodayAndExit('还需 ' + waitMin + ' 分钟到可续期时间');
+        }
+      }
+
+      // 3. 剩余 > 阈值 → 预约几天后再查
       if (totalMins !== null && thresholdHours !== null) {
         var h = totalMins / 60;
         if (h > thresholdHours) {
           var hoursToGo = h - thresholdHours;
           var days = Math.max(1, Math.ceil(hoursToGo / 24));
           console.log('🔭 剩余 ' + h.toFixed(1) + 'h > 阈值 ' + thresholdHours + 'h，预约 ' + days + ' 天后');
-          await sendTG('🔭', '探测跳过', '剩余 ' + h.toFixed(1) + 'h，预约 ' + days + ' 天后');
+          await sendTGOnce('🔭', '探测跳过', '剩余 ' + h.toFixed(1) + 'h，预约 ' + days + ' 天后');
           updateNextCheckDate(days, '等待进入可续期窗口');
           process.exit(0);
         }

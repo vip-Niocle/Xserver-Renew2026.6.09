@@ -315,11 +315,17 @@ async function tryRenew(page, beforeMins, thresholdHours) {
 
     // 动态计算下次检查：用续期后剩余时间 - 阈值，算出几天后再查
     var nextDays = 3;
-    if (afterMins !== null && thresholdHours !== null) {
+    var persistThreshold = thresholdHours;
+    if (persistThreshold === null) {
+      // 页面不限制时，从历史记录或 fallback 取阈值
+      var s2 = getAccountStatus();
+      persistThreshold = s2.thresholdHours || 16;
+    }
+    if (afterMins !== null) {
       var newH = afterMins / 60;
-      var calcDays = Math.ceil((newH - thresholdHours) / 24);
+      var calcDays = Math.ceil((newH - persistThreshold) / 24);
       nextDays = Math.max(1, calcDays);
-      console.log('📐 续期后剩余 ' + fmtHours(newH) + '，阈值 ' + thresholdHours + 'h，约 ' + nextDays + ' 天后复查');
+      console.log('📐 续期后剩余 ' + fmtHours(newH) + '，阈值 ' + persistThreshold + 'h，约 ' + nextDays + ' 天后复查');
     }
 
     var status = loadStatus();
@@ -397,6 +403,12 @@ async function tryRenew(page, beforeMins, thresholdHours) {
 
     if (extendInfo.restricted) {
       thresholdHours = extendInfo.thresholdHours;
+
+      // 持久化阈值，下次运行时遇到页面不限制也能用
+      var st = loadStatus();
+      if (!st[ACC]) st[ACC] = {};
+      st[ACC].thresholdHours = thresholdHours;
+      saveStatus(st);
 
       // 1. 有精确的未来日期 → 预约到那天，退出
       if (extendInfo.nextDate && extendInfo.nextDate > getTodayStr()) {
